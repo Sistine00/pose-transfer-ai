@@ -1,0 +1,12 @@
+# Minimal requirements for running the pose-transfer pipeline
+# Versions are recommendations; update as needed for your environment
+torch
+diffusers[torch]
+transformers
+accelerate
+safetensors
+opencv-python
+Pillow
+mediapipe
+numpy
+scipy
