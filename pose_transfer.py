@@ -1,18 +1,13 @@
 """pose_transfer.py
 
-Core PoseTransfer class:
-- extracts pose from a reference image using MediaPipe
-- renders a pose map image suitable for ControlNet (OpenPose-style skeleton)
-- uses Hugging Face Diffusers StableDiffusionControlNetPipeline + ControlNet
-
-This is a practical, minimal implementation. For production or large-scale
-use, add proper error handling, model caching, scheduler choices, and
-resource management specific to your environment.
+Core PoseTransfer class with support for multiple target images including
+automatic alignment before combining. Uses the best reference image (the one
+with the most detected landmarks) for alignment.
 """
 from __future__ import annotations
 import os
 from io import BytesIO
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -26,7 +21,8 @@ from transformers import logging as transformers_logging
 transformers_logging.set_verbosity_error()
 
 # Local helper functions
-from utils.image_utils import load_image, save_image, make_pose_map_from_landmarks, resize_to
+from utils.image_utils import (load_image, save_image, make_pose_map_from_landmarks,
+                               resize_to, combine_images_median, align_and_combine_images)
 
 
 DEFAULT_SD_MODEL = "runwayml/stable-diffusion-v1-5"
@@ -97,8 +93,32 @@ class PoseTransfer:
         pose_map = make_pose_map_from_landmarks(img, size=size)
         return pose_map
 
+    def prepare_target_image(self, target_images: Union[str, List[str]], size: Tuple[int, int]) -> Image.Image:
+        """Prepare the init/target image from a single path or a list of paths.
+
+        If multiple images are provided, we align them to the best reference using
+        face or body keypoints and combine them with a per-pixel median to
+        aggregate appearance information from multiple photos of the same person.
+        """
+        if isinstance(target_images, str):
+            img = load_image(target_images).convert("RGB")
+            img = resize_to(img, size)
+            return img
+        if isinstance(target_images, list):
+            if len(target_images) == 0:
+                raise ValueError("Empty target_images list")
+            # attempt alignment-aware combination
+            try:
+                composite = align_and_combine_images(target_images, size)
+                return composite
+            except Exception:
+                # fallback to simple median combine
+                composite = combine_images_median(target_images, size)
+                return composite
+        raise ValueError("target_images must be a path or a list of paths")
+
     def transfer_pose(self,
-                      target_image: str,
+                      target_images: Union[str, List[str]],
                       reference_image: str,
                       prompt: str = "person",
                       num_steps: int = 30,
@@ -108,12 +128,11 @@ class PoseTransfer:
                       generator: Optional[torch.Generator] = None) -> Image.Image:
         """Perform pose transfer and return a PIL Image result.
 
-        target_image: path to target person image (used as base / init image)
+        target_images: path or list of paths to target person images (used as base / init image)
         reference_image: path containing desired pose
         """
         # prepare images
-        target = load_image(target_image).convert("RGB")
-        target = resize_to(target, output_size)
+        target = self.prepare_target_image(target_images, output_size)
 
         pose_map = self.extract_pose_map(reference_image, size=output_size).convert("RGB")
 
@@ -121,7 +140,19 @@ class PoseTransfer:
         # prompt, image (init image), control_image (controlnet conditioning image)
         print("Running the diffusion pipeline ... this may take a while.")
 
-        with torch.autocast(self.device.type) if self.device.type == "cuda" else torch.cpu.amp.autocast(enabled=False):
+        # use autocast to leverage fp16 on CUDA
+        if self.device.type == "cuda":
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=self.torch_dtype)
+        else:
+            # torch.cpu.amp.autocast is only available in newer torch; use a no-op context manager
+            class _noop:
+                def __enter__(self):
+                    return None
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+            autocast_ctx = _noop()
+
+        with autocast_ctx:
             outputs = self.pipeline(
                 prompt=prompt,
                 num_inference_steps=num_steps,
@@ -143,4 +174,4 @@ class PoseTransfer:
 
 if __name__ == "__main__":
     # quick smoke test (no model downloads) - ensure imports and basic flows work
-    print("PoseTransfer module loaded. Run pose_transfer_cli.py to use the CLI.")
+    print("PoseTransfer module loaded. Use pose_transfer_cli.py to run the CLI. For multiple target photos pass a list to the API or use --targets in the CLI.")
