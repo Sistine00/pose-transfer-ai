@@ -6,11 +6,13 @@ Contains:
 - resizing helpers
 - combining multiple target images into a single appearance composite
 - automatic alignment utilities (face and body keypoints)
+- debug visualizations saving to disk
+- face mask extraction and face-aware blending (seamlessClone)
 """
 from __future__ import annotations
 from typing import Tuple, List, Optional
 
-import io
+import os
 from PIL import Image, ImageDraw
 import numpy as np
 import cv2
@@ -27,6 +29,7 @@ def load_image(path: str) -> Image.Image:
 
 
 def save_image(img: Image.Image, path: str, quality: int = 95) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     img.save(path, quality=quality)
 
 
@@ -58,7 +61,7 @@ def combine_images_median(paths: List[str], size: Tuple[int, int]) -> Image.Imag
     return Image.fromarray(median)
 
 
-# --- Alignment utilities ---
+# --- Alignment utilities & debug helpers ---
 
 def _detect_face_landmark_points(img: Image.Image, indices: List[int] = [33, 263, 1]) -> Optional[List[Tuple[float, float]]]:
     """Detect facial landmark points using MediaPipe FaceMesh.
@@ -98,6 +101,22 @@ def _count_face_landmarks(img: Image.Image) -> int:
             return 0
         landmarks = results.multi_face_landmarks[0].landmark
         return len(landmarks)
+
+
+def _detect_face_landmarks_all(img: Image.Image) -> Optional[List[Tuple[float, float]]]:
+    """Return all face landmarks (x,y) using MediaPipe FaceMesh or None."""
+    if mp is None:
+        return None
+    mp_face = mp.solutions.face_mesh
+    with mp_face.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=False) as face_mesh:
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        results = face_mesh.process(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+        if not results.multi_face_landmarks:
+            return None
+        landmarks = results.multi_face_landmarks[0].landmark
+        h, w = img.size[1], img.size[0]
+        pts = [(lm.x * w, lm.y * h) for lm in landmarks]
+        return pts
 
 
 def _detect_pose_points(img: Image.Image, indices: List[int] = [11, 12, 23]) -> Optional[List[Tuple[float, float]]]:
@@ -152,7 +171,6 @@ def _estimate_transform(src_pts: List[Tuple[float, float]], dst_pts: List[Tuple[
         return None
     src = np.array(src_pts, dtype=np.float32)
     dst = np.array(dst_pts, dtype=np.float32)
-    # estimateAffinePartial2D requires at least 3 points for robust result; if only 2, it still works but less stable
     try:
         M, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.LMEDS)
         if M is None:
@@ -168,19 +186,109 @@ def _warp_image(img: Image.Image, M: np.ndarray, size: Tuple[int, int]) -> Image
     return Image.fromarray(warped)
 
 
-def align_and_combine_images(paths: List[str], size: Tuple[int, int]) -> Image.Image:
-    """Align multiple images to the best reference (the one with most detected landmarks) and combine them using per-pixel median.
+def _draw_landmarks_overlay(img: Image.Image, face_landmarks: Optional[List[Tuple[float, float]]], pose_landmarks: Optional[List[Tuple[float, float]]]) -> Image.Image:
+    """Return an image with landmarks drawn on top for visualization."""
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    if face_landmarks:
+        for (x, y) in face_landmarks:
+            r = max(2, int(out.size[0] / 200))
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=(255, 0, 0), width=2)
+    if pose_landmarks:
+        for (x, y) in pose_landmarks:
+            r = max(2, int(out.size[0] / 200))
+            draw.ellipse((x - r, y - r, x + r, y + r), outline=(0, 0, 255), width=2)
+    return out
 
-    Steps:
-    1. Load and resize all images.
-    2. Detect face/pose landmarks for each image and pick the reference image as the one with the most landmarks detected.
-    3. For each image, estimate affine transform to the reference using face landmarks if available, otherwise pose landmarks.
-    4. Warp images to align them, then compute per-pixel median to combine.
 
-    If landmarks cannot be found for an image, that image is resized without alignment and still included in the median.
+def _create_face_mask_from_landmarks(img: Image.Image, landmarks: List[Tuple[float, float]], blur: int = 15) -> np.ndarray:
+    """Create a binary face mask from a list of face landmarks.
+
+    Uses convex hull of landmarks and optional Gaussian blur to smooth edges.
+    Returns mask as uint8 single-channel array with values 0 or 255.
+    """
+    h, w = img.size[1], img.size[0]
+    pts = np.array(landmarks, dtype=np.int32)
+    # compute convex hull
+    hull = cv2.convexHull(pts)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.fillConvexPoly(mask, hull, 255)
+    if blur > 0:
+        k = max(1, int(blur // 2) * 2 + 1)
+        mask = cv2.GaussianBlur(mask, (k, k), 0)
+    return mask
+
+
+def blend_face_from_source_to_target(source: Image.Image, target: Image.Image, debug_dir: Optional[str] = None, debug_prefix: str = "face_blend") -> Image.Image:
+    """Blend the face region from source onto target using OpenCV seamlessClone.
+
+    - Detect face landmarks on the source image (face must be present).
+    - Create a face mask from landmarks and compute center for cloning.
+    - Use cv2.seamlessClone to blend the source face into the target image.
+    - If face detection fails, returns target unchanged.
+
+    If debug_dir is provided, save mask and intermediate visualizations.
+    """
+    if mp is None:
+        # cannot detect face; return target unchanged
+        return target
+
+    src = source.convert("RGB")
+    tgt = target.convert("RGB")
+
+    face_landmarks = _detect_face_landmarks_all(src)
+    if face_landmarks is None:
+        return target
+
+    # create mask
+    mask = _create_face_mask_from_landmarks(src, face_landmarks, blur=15)
+
+    # compute center for seamlessClone as centroid of hull
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0 or len(ys) == 0:
+        return target
+    center = (int(np.mean(xs)), int(np.mean(ys)))
+
+    src_np = cv2.cvtColor(np.array(src), cv2.COLOR_RGB2BGR)
+    tgt_np = cv2.cvtColor(np.array(tgt), cv2.COLOR_RGB2BGR)
+
+    # ensure mask is 3-channel for seamlessClone
+    mask_3c = mask
+
+    try:
+        mixed = cv2.seamlessClone(src_np, tgt_np, mask, center, cv2.NORMAL_CLONE)
+    except Exception:
+        # fallback to normal clone with 3-channel mask
+        try:
+            mixed = cv2.seamlessClone(src_np, tgt_np, mask, center, cv2.MIXED_CLONE)
+        except Exception:
+            return target
+
+    blended = Image.fromarray(cv2.cvtColor(mixed, cv2.COLOR_BGR2RGB))
+
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
+        # save mask visualization
+        mask_vis = Image.fromarray(mask).convert("RGB")
+        save_image(mask_vis, os.path.join(debug_dir, f"{debug_prefix}_mask.jpg"))
+        # save source overlay
+        save_image(_draw_landmarks_overlay(src, face_landmarks, None), os.path.join(debug_dir, f"{debug_prefix}_source_overlay.jpg"))
+        # save blended result
+        save_image(blended, os.path.join(debug_dir, f"{debug_prefix}_blended.jpg"))
+
+    return blended
+
+
+def align_and_combine_images(paths: List[str], size: Tuple[int, int], debug_dir: Optional[str] = None) -> Image.Image:
+    """Align multiple images to the best reference (the one with the most detected landmarks) and combine them using per-pixel median.
+
+    If debug_dir is provided, save intermediate resized images, overlays, warped images and the final composite into that directory.
     """
     if len(paths) == 0:
         raise ValueError("No images provided")
+
+    if debug_dir:
+        os.makedirs(debug_dir, exist_ok=True)
 
     # load and resize all images first
     imgs = [resize_to(load_image(p).convert("RGB"), size) for p in paths]
@@ -199,10 +307,25 @@ def align_and_combine_images(paths: List[str], size: Tuple[int, int]) -> Image.I
     ref_face_pts = _detect_face_landmark_points(ref_img) if face_counts[best_idx] > 0 else None
     ref_pose_pts = _detect_pose_points(ref_img) if pose_counts[best_idx] > 0 else None
 
+    if debug_dir:
+        # save the selected reference and an overlay
+        save_image(ref_img, os.path.join(debug_dir, f"ref_selected_{best_idx}.jpg"))
+        overlay = _draw_landmarks_overlay(ref_img, _detect_face_landmarks_all(ref_img), ref_pose_pts)
+        save_image(overlay, os.path.join(debug_dir, f"ref_selected_{best_idx}_overlay.jpg"))
+
     aligned_images = []
 
     # include all images: if an image is the reference, include as-is (resized)
     for i, img in enumerate(imgs):
+        # save resized
+        if debug_dir:
+            save_image(img, os.path.join(debug_dir, f"img_{i}_resized.jpg"))
+            # overlays on resized
+            face_pts = _detect_face_landmarks_all(img)
+            pose_pts = _detect_pose_points(img)
+            overlay = _draw_landmarks_overlay(img, face_pts, pose_pts)
+            save_image(overlay, os.path.join(debug_dir, f"img_{i}_resized_overlay.jpg"))
+
         if i == best_idx:
             aligned_images.append(np.array(img, dtype=np.uint8))
             continue
@@ -223,6 +346,11 @@ def align_and_combine_images(paths: List[str], size: Tuple[int, int]) -> Image.I
             try:
                 warped = _warp_image(img, M, size)
                 aligned_images.append(np.array(warped, dtype=np.uint8))
+                if debug_dir:
+                    save_image(warped, os.path.join(debug_dir, f"img_{i}_warped.jpg"))
+                    # overlay on warped (draw reference landmarks for visualization)
+                    warped_overlay = _draw_landmarks_overlay(warped, _detect_face_landmarks_all(ref_img), ref_pose_pts)
+                    save_image(warped_overlay, os.path.join(debug_dir, f"img_{i}_warped_overlay.jpg"))
                 continue
             except Exception:
                 # fallback to unaligned resized
@@ -234,7 +362,12 @@ def align_and_combine_images(paths: List[str], size: Tuple[int, int]) -> Image.I
     stack = np.stack(aligned_images, axis=0)
     median = np.median(stack.astype(np.float32), axis=0)
     median = np.clip(median, 0, 255).astype(np.uint8)
-    return Image.fromarray(median)
+    composite = Image.fromarray(median)
+
+    if debug_dir:
+        save_image(composite, os.path.join(debug_dir, "combined_median.jpg"))
+
+    return composite
 
 
 def make_pose_map_from_landmarks(img: Image.Image, size: Tuple[int, int] = (512, 512)) -> Image.Image:
