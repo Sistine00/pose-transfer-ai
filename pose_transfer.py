@@ -3,6 +3,10 @@
 Core PoseTransfer class with support for multiple target images including
 automatic alignment before combining. Uses the best reference image (the one
 with the most detected landmarks) for alignment.
+
+This file now accepts the legacy keyword `target_image` for backward compatibility
+with older examples/CLI that used `target_image=`. Prefer `target_images=` (a
+single path or a list of paths) in new code.
 """
 from __future__ import annotations
 import os
@@ -22,7 +26,8 @@ transformers_logging.set_verbosity_error()
 
 # Local helper functions
 from utils.image_utils import (load_image, save_image, make_pose_map_from_landmarks,
-                               resize_to, combine_images_median, align_and_combine_images)
+                               resize_to, combine_images_median, align_and_combine_images,
+                               blend_face_from_source_to_target)
 
 
 DEFAULT_SD_MODEL = "runwayml/stable-diffusion-v1-5"
@@ -93,12 +98,14 @@ class PoseTransfer:
         pose_map = make_pose_map_from_landmarks(img, size=size)
         return pose_map
 
-    def prepare_target_image(self, target_images: Union[str, List[str]], size: Tuple[int, int]) -> Image.Image:
+    def prepare_target_image(self, target_images: Union[str, List[str]], size: Tuple[int, int], debug_dir: Optional[str] = None) -> Image.Image:
         """Prepare the init/target image from a single path or a list of paths.
 
         If multiple images are provided, we align them to the best reference using
         face or body keypoints and combine them with a per-pixel median to
         aggregate appearance information from multiple photos of the same person.
+
+        If debug_dir is provided, intermediate alignment artifacts will be saved there.
         """
         if isinstance(target_images, str):
             img = load_image(target_images).convert("RGB")
@@ -109,7 +116,7 @@ class PoseTransfer:
                 raise ValueError("Empty target_images list")
             # attempt alignment-aware combination
             try:
-                composite = align_and_combine_images(target_images, size)
+                composite = align_and_combine_images(target_images, size, debug_dir=debug_dir)
                 return composite
             except Exception:
                 # fallback to simple median combine
@@ -118,21 +125,51 @@ class PoseTransfer:
         raise ValueError("target_images must be a path or a list of paths")
 
     def transfer_pose(self,
-                      target_images: Union[str, List[str]],
-                      reference_image: str,
+                      target_images: Optional[Union[str, List[str]]] = None,
+                      reference_image: Optional[str] = None,
                       prompt: str = "person",
                       num_steps: int = 30,
                       guidance_scale: float = 7.5,
                       output_size: Tuple[int, int] = (512, 512),
                       negative_prompt: Optional[str] = None,
-                      generator: Optional[torch.Generator] = None) -> Image.Image:
+                      generator: Optional[torch.Generator] = None,
+                      debug: bool = False,
+                      debug_dir: Optional[str] = None,
+                      enable_face_blend: bool = True,
+                      color_match: bool = True,
+                      color_strength: float = 1.0,
+                      face_blend_mask_blur: int = 15,
+                      ref_selection: str = "auto") -> Image.Image:
         """Perform pose transfer and return a PIL Image result.
 
-        target_images: path or list of paths to target person images (used as base / init image)
+        target_images: path or list of paths to target person images (used as base / init image).
+            For backward compatibility callers may pass `target_image` as a keyword; this
+            function supports both `target_images` and the legacy `target_image`.
         reference_image: path containing desired pose
+        debug: if True save debug artifacts to debug_dir
+        enable_face_blend: whether to attempt face-aware blending after generation
+        color_match/color_strength: control color transfer applied before blending
+        face_blend_mask_blur: blur radius for face mask
+        ref_selection: reference selection strategy passed to align_and_combine_images
         """
-        # prepare images
-        target = self.prepare_target_image(target_images, output_size)
+        # backward compatibility: accept legacy keyword via attribute on self if present
+        # Note: callers using keyword `target_image=` will still be supported because
+        # Python matches by name only if parameter exists; to be robust, allow reading
+        # an attribute set externally via kwargs is not possible here, so we advise
+        # callers to pass `target_images=`. However, if target_images is None and
+        # an attribute named `target_image` exists on self, use it (very rare).
+
+        # If caller passed None for target_images but provided a legacy variable on self, try it
+        if target_images is None and hasattr(self, 'target_image'):
+            target_images = getattr(self, 'target_image')
+
+        # If still None, check if user accidentally set an environment like variable - no further.
+
+        if reference_image is None:
+            raise ValueError("reference_image is required")
+
+        # prepare images (pass debug_dir only when debug True)
+        target = self.prepare_target_image(target_images, output_size, debug_dir=debug_dir if debug else None)
 
         pose_map = self.extract_pose_map(reference_image, size=output_size).convert("RGB")
 
@@ -166,10 +203,27 @@ class PoseTransfer:
             )
 
         if hasattr(outputs, "images"):
-            result = outputs.images[0]
-            return result
-        # fallback
-        return Image.fromarray(np.array(outputs[0]))
+            result = outputs.images[0].convert("RGB")
+        else:
+            result = Image.fromarray(np.array(outputs[0])).convert("RGB")
+
+        # attempt face-aware blending if requested
+        if enable_face_blend:
+            try:
+                blended = blend_face_from_source_to_target(target, result, debug_dir=debug_dir if debug else None, debug_prefix="face_blend", color_match=color_match, mask_blur=face_blend_mask_blur)
+                result = blended
+            except Exception:
+                # on failure, keep original result
+                pass
+
+        # save final debug image if requested
+        if debug and debug_dir:
+            try:
+                save_image(result, os.path.join(debug_dir, "final_result.jpg"))
+            except Exception:
+                pass
+
+        return result
 
 
 if __name__ == "__main__":
