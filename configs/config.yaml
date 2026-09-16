@@ -1,0 +1,85 @@
+"""
+配置文件管理 - pose-transfer-ai 项目配置
+"""
+
+# 模型配置
+models:
+  # Stable Diffusion 基础模型选项
+  stable_diffusion:
+    v1_5: "runwayml/stable-diffusion-v1-5"  # 标准模型
+    v2: "stabilityai/stable-diffusion-2"
+    sdxl: "stabilityai/stable-diffusion-xl-base-1.0"  # 更高质量
+  
+  # ControlNet 姿态检测模型
+  controlnet:
+    openpose: "lllyasviel/sd-controlnet-openpose"  # 标准OpenPose
+    dwpose: "bdsqlsz/control_v11p_sd15_dwpose"  # DWPose - 更精准的手部和面部
+    depth: "lllyasviel/sd-controlnet-depth"  # 深度图 - 结构保留
+    canny: "lllyasviel/sd-controlnet-canny"  # Canny边缘 - 轮廓保留
+
+# 推理参数
+inference:
+  default_steps: 30  # 推理步数
+  default_guidance_scale: 7.5  # 引导尺度
+  default_output_size: [512, 512]  # 输出尺寸
+  default_negative_prompt: "low quality, blurry, distorted"
+  
+  # SDXL 推理参数
+  sdxl:
+    default_steps: 40
+    default_guidance_scale: 8.0
+    default_output_size: [1024, 1024]
+
+# 图像处理
+image_processing:
+  enable_face_blend: true  # 面部融合
+  enable_color_matching: true  # 颜色匹配
+  color_strength: 1.0  # 颜色转移强度
+  face_blend_mask_blur: 15  # 面部融合掩膜模糊半径
+  align_images: true  # 自动对齐多张图像
+  
+  # 批处理
+  batch_processing:
+    enable: true
+    max_batch_size: 4
+    
+  # 视频处理
+  video_processing:
+    enable: true
+    max_frames: 300
+    skip_frames: 1  # 每N帧处理一帧
+
+# 性能优化
+performance:
+  enable_attention_slicing: true  # 注意力切片
+  enable_fp16: true  # 半精度推理
+  enable_model_caching: true  # 模型缓存
+  cache_dir: "./models_cache"
+  memory_efficient: true  # 内存优化
+  
+  # GPU 配置
+  gpu:
+    enable_cuda: true
+    enable_cudnn_benchmark: true
+
+# 日志配置
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  save_logs: true
+  log_dir: "./logs"
+  
+# 调试配置
+debug:
+  save_intermediate: false  # 保存中间结果
+  save_debug_dir: "./debug_output"
+  verbose: false
+
+# UI 配置
+ui:
+  gradio:
+    share: false
+    debug: false
+    show_error: true
+    theme: "default"
+    server_port: 7860
+    server_name: "0.0.0.0"
