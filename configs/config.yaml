@@ -1,7 +1,3 @@
-"""
-配置文件管理 - pose-transfer-ai 项目配置
-"""
-
 # 模型配置
 models:
   # Stable Diffusion 基础模型选项
